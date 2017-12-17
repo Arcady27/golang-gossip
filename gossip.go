@@ -17,13 +17,6 @@ type Message struct {
     Data string
 }
 
-type Notification struct {
-    Id int
-    Type string
-    Sender int
-    Origin int
-}
-
 func marshal_message(id int, type_ string, sender int, origin int, data string) []byte {
     text := Message{
         Id:     id,
@@ -31,20 +24,6 @@ func marshal_message(id int, type_ string, sender int, origin int, data string) 
         Sender:   sender,
         Origin:   origin,
         Data:   data,
-    }
-    b, err := json.Marshal(text)
-    if err != nil {
-        fmt.Println("error:", err)
-    }
-    return b
-}
-
-func marshal_notification(id int, type_ string, sender int, origin int) []byte {
-    text := Notification{
-        Id:     id,
-        Type:   type_,
-        Sender:   sender,
-        Origin:   origin,
     }
     b, err := json.Marshal(text)
     if err != nil {
@@ -70,83 +49,90 @@ func parse_json (json_string []byte) Message {
     return Message{id, msg_type, sender, origin, ""}
 }
 
-func CheckError(err error) {
+func CheckError(err error) bool{
     if err  != nil {
         fmt.Println("Error: " , err)
+        return false;
     } 
+    return true;
 }
 
-func message_neighbours(g graph.Graph, node graph.Node, message Message) {
+func message_neighbours(g graph.Graph, node graph.Node, message Message) bool{
     
     //get all neighbors
     neighbors, _ := g.Neighbors(node.Id())
-    fmt.Println("neigh", node.Id(), neighbors)
 
     //select random neighbor
     neighbor_ind := rand.Intn(len(neighbors))
+    for neighbors[neighbor_ind].Id() == message.Sender {
+        neighbor_ind = rand.Intn(len(neighbors))
+    }
     neighbor := neighbors[neighbor_ind]
-
+    
     //resolve addresses
     LocalAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-    CheckError(err)
-    
+    if (!CheckError(err)) {
+        return false;
+    }
     ServerAddr,err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", neighbor.Port()))
-    CheckError(err)
-        
-    
-    if neighbor.Id() != message.Sender {
-        MsgConn, err := net.DialUDP("udp", LocalAddr, ServerAddr)
-        CheckError(err)
-            
-        if (err == nil) {
-            fmt.Println(fmt.Sprintf("message from:%d | to:%d | %s", node.Id(), neighbor.Id(), "multicast"))
-                    
-            buf := marshal_message(message.Id, "multicast", node.Id(), message.Origin, message.Data)
-            _,err_ := MsgConn.Write(buf)
-            CheckError(err_)   
-                
-            buf = marshal_message(message.Id, "notification", node.Id(), message.Origin, message.Data)
-            _,err_ = MsgConn.Write(buf)
-            CheckError(err_)   
-        }
+    if (!CheckError(err)) {
+         return false;
+    }    
 
-        MsgConn.Close()                
+    Conn, err := net.ListenUDP("udp", LocalAddr)
+    CheckError(err)
+    defer Conn.Close()
+
+    //send to neighbor if it is different from sender
+    if neighbor.Id() != message.Sender {
+        
+        if (!CheckError(err)) {
+           return false;
+        }    
+            
+        //send message
+        buf := marshal_message(message.Id, message.Type, node.Id(), message.Origin, message.Data)
+        _,err_ := Conn.WriteToUDP(buf, ServerAddr)
+        CheckError(err_)   
+        return true;            
     }
 
-    //time.Sleep(time.Second * 1) 
+    return true;
 }
 
-func node_daemon(g graph.Graph, node graph.Node) {
+func node_daemon(g graph.Graph, node graph.Node, stop *bool, current_time *int) {
     
     //initialize listening to port
-    ServerAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", node.Port()))
-    fmt.Println("server started at port:", node.Port())
+    ServerAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", node.Port()))
     CheckError(err)
-    buf := make([]byte, 1024)
     Conn, err := net.ListenUDP("udp", ServerAddr)
     CheckError(err)
+    defer Conn.Close()
+    buf := make([]byte, 1024)
 
     if (node.Id() > 0) {
         messages_map := map[int]Message{}
 
-        //infinite loop
-        for i:=0;;i+=1 {
+        for i:=0;*stop == false;i+=1 {
 
             //read message
-            n,addr,err := Conn.ReadFromUDP(buf)
+            Conn.SetReadDeadline(time.Now().Add(time.Second))
+            n,_,err := Conn.ReadFromUDP(buf)
             CheckError(err)
+            
+            if err == nil {
+                //parse JSON message
+                message := parse_json(buf[0:n])
+                
+                //add message to map if it is new
+                if _, ok := messages_map[message.Id]; !ok {
+                    messages_map[message.Id] = message 
 
-            //parse JSON message
-            json_str := fmt.Sprintf("'%s'",string(buf[0:n]))
-            fmt.Println(fmt.Sprintf("node %d received ", node.Id()), json_str, " from ",addr)
-            message := parse_json(buf[0:n])
-
-            fmt.Println(messages_map)
-
-            //add message to map if it is new and multicast
-            if _, ok := messages_map[message.Id]; !ok {
-                if message.Type == "multicast" {
-                    messages_map[message.Id] = message  
+                    //if it multicast, also add notification of it 
+                    if message.Type == "multicast" {
+                        new_id := message.Id + 100000 * node.Id()
+                        messages_map[new_id] = Message{new_id, "notification", node.Id(), node.Id(), ""}
+                    }
                 }
             }
 
@@ -154,49 +140,70 @@ func node_daemon(g graph.Graph, node graph.Node) {
             for _, v := range messages_map { 
                 message_neighbours(g, node, v)
             }
+
+            time.Sleep(time.Second / 10)
         }
 
-    } else
+    } else //actions for root node
     {            
-        message_neighbours(g, node, Message{0, "multicast", 0, 0, "bla"})
-        
+
         reply_got := map[int]bool{}
-    
-        for {
-            n,addr,err := Conn.ReadFromUDP(buf)
-            CheckError(err)
+        
+        //wait until all servers start
+        time.Sleep(time.Second) 
 
-            json_str := fmt.Sprintf("'%s'",string(buf[0:n]))
-            fmt.Println(fmt.Sprintf("node %d received ", node.Id()), json_str, " from ",addr)
-            message := parse_json(buf[0:n])
-
-            if message.Type == "notification" {
-                reply_got[message.Sender] = true 
+        for t:=0;;t+=1{
+            
+            //send to neighbors
+            message_neighbours(g, node, Message{0, "multicast", 0, 0, "from root"})
+            if *stop == false {
+                *current_time += 1
             }
 
-            fmt.Println(reply_got)
-            if len(reply_got) == len(g) - 1 {
-                fmt.Println("FINISH")
+            //read message
+            Conn.SetReadDeadline(time.Now().Add(time.Second))
+            n,_,err := Conn.ReadFromUDP(buf)
+            CheckError(err)
 
-            } 
+            if err == nil {
+                //parse JSON message
+                message := parse_json(buf[0:n])
+                
+                //mark that a node got initial message
+                if message.Type == "notification" {
+                    reply_got[message.Origin] = true 
+                }
+
+                fmt.Println("replies", len(reply_got), *current_time)
+                if len(reply_got) == len(g) - 1 {
+                    *stop = true;
+                }
+            }
+
+            time.Sleep(time.Second / 10)
         }
     }
 }
 
 
 func main() {
-    const n = 5
+    const n = 10
     const basic_port = 10000
-    net := graph.Generate(n, n-1, n, basic_port)
+    net := graph.Generate(n, 2, 10, basic_port)
+    
+    stop := false
+    current_time := 0
+
     for i := 0; i < n; i++ {
         cur_node, is_ok := net.GetNode(i)
         neigh, is_ok := net.Neighbors(cur_node.Id())
-        fmt.Println(cur_node.Id(), cur_node.Port(), neigh)
+        fmt.Println(cur_node.Id(), cur_node.Port(), neigh, is_ok)
         if is_ok {
-            go node_daemon(net, cur_node)
+            go node_daemon(net, cur_node, &stop, &current_time)
         }       
     }
-
-       
-    time.Sleep(time.Second*100)
+    for stop == false { 
+        time.Sleep(time.Second / 100)
+    }
+    fmt.Println("TOTAL TIME", current_time)
 }
